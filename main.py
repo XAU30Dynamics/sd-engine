@@ -17,13 +17,18 @@ Endpoints:
   POST /optimize-async        — submit async optimisation job, returns job_id immediately
   GET  /optimize-status/{id}  — poll async optimisation job status + progress
   DELETE /optimize/{id}       — cancel a running async optimisation job
+  POST /update                — download latest engine from GitHub and restart
   GET  /health                — health check
 """
 
 import os
+import re
 import time
 import threading
 import json
+import urllib.request
+import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 from fastapi import FastAPI, HTTPException, Request
@@ -41,7 +46,7 @@ import traceback
 import uuid
 import types
 
-app = FastAPI(title="AlgoTrader Backtest Engine", version="3.2.0")
+app = FastAPI(title="AlgoTrader Backtest Engine", version="3.3.0")
 
 # Read allowed origins from ALLOWED_ORIGINS env var (comma-separated) or use safe defaults.
 # Set ALLOWED_ORIGINS="https://myapp.com,https://api.myapp.com" on the server to restrict access.
@@ -2433,11 +2438,56 @@ async def check_cache(cache_key: str):
     return JSONResponse({"exists": False})
 
 
+@app.post("/update")
+async def update_engine(request: Request):
+    """Receive new engine content from backend and restart, or pull from GitHub as fallback."""
+    current_file = os.path.abspath(__file__)
+
+    try:
+        body = await request.json()
+        pushed_content: str | None = body.get("content") if isinstance(body, dict) else None
+    except Exception:
+        pushed_content = None
+
+    if pushed_content:
+        new_content = pushed_content
+    else:
+        GITHUB_URL = "https://raw.githubusercontent.com/XAU30Dynamics/sd-engine/main/main.py"
+        try:
+            with urllib.request.urlopen(GITHUB_URL, timeout=30) as resp:
+                new_content = resp.read().decode("utf-8")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Failed to download update: {str(e)}")
+
+    match = re.search(r'version="([^"]+)"', new_content)
+    new_version = match.group(1) if match else "unknown"
+
+    try:
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".py", dir=os.path.dirname(current_file))
+        os.close(tmp_fd)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        shutil.move(tmp_path, current_file)
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to write update: {str(e)}")
+
+    def _exit_soon():
+        time.sleep(1)
+        os._exit(0)
+
+    threading.Thread(target=_exit_soon, daemon=True).start()
+    return {"status": "ok", "version": new_version, "message": "Engine updated. Restarting…"}
+
+
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "endpoints": ["/backtest", "/backtest-custom", "/walk-forward", "/monte-carlo", "/optimize", "/optimize-async", "/optimize-status/{id}", "DELETE /optimize/{id}"],
         "libraries": {
             "pandas": pd.__version__,
@@ -2451,7 +2501,7 @@ async def health():
 @app.get("/")
 async def root():
     return {
-        "message": "AlgoTrader VPS Backtest Engine v3.2 is running.",
+        "message": "AlgoTrader VPS Backtest Engine v3.3 is running.",
         "endpoints": {
             "POST /backtest": "Fixed indicator-based backtest (legacy)",
             "POST /backtest-custom": "AI-generated Python signal code backtest",
