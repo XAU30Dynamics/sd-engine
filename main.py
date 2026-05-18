@@ -46,7 +46,7 @@ import traceback
 import uuid
 import types
 
-app = FastAPI(title="AlgoTrader Backtest Engine", version="3.3.1")
+app = FastAPI(title="AlgoTrader Backtest Engine", version="3.3.2")
 
 # Read allowed origins from ALLOWED_ORIGINS env var (comma-separated) or use safe defaults.
 # Set ALLOWED_ORIGINS="https://myapp.com,https://api.myapp.com" on the server to restrict access.
@@ -2498,7 +2498,7 @@ async def update_engine(request: Request):
 async def health():
     return {
         "status": "ok",
-        "version": "3.3.0",
+        "version": app.version,
         "endpoints": ["/backtest", "/backtest-custom", "/walk-forward", "/monte-carlo", "/optimize", "/optimize-async", "/optimize-status/{id}", "DELETE /optimize/{id}"],
         "libraries": {
             "pandas": pd.__version__,
