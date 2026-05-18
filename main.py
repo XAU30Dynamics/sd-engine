@@ -46,7 +46,7 @@ import traceback
 import uuid
 import types
 
-app = FastAPI(title="AlgoTrader Backtest Engine", version="3.3.0")
+app = FastAPI(title="AlgoTrader Backtest Engine", version="3.3.1")
 
 # Read allowed origins from ALLOWED_ORIGINS env var (comma-separated) or use safe defaults.
 # Set ALLOWED_ORIGINS="https://myapp.com,https://api.myapp.com" on the server to restrict access.
@@ -144,7 +144,9 @@ def _run_optimize_bg(job_id: str, req) -> None:
         _save_job_disk(job_id)
 
         df = bars_to_df(req.bars)
-        pip_size = get_pip_size(req.symbol) if req.symbol else 0.0001
+        # Prefer the caller-supplied pip_size when provided (canonical source of truth).
+        # Fall back to the engine's symbol-keyword lookup so older callers continue to work.
+        pip_size = req.pip_size if (getattr(req, "pip_size", None) is not None) else (get_pip_size(req.symbol) if req.symbol else 0.0001)
         results = []
         tested_combinations = 0
         _start_time = time.time()
@@ -600,6 +602,7 @@ class CustomBacktestRequest(BaseModel):
     spreadPips: float = 0.0             # Bid/ask spread in pips — applied half on entry, half on exit
     slippagePips: float = 0.0           # Execution slippage in pips — applied in full on entry and exit
     maxOpenPositions: int = 1           # Engine is single-position only. Values >1 are clamped to 1 with a warning.
+    pip_size: Optional[float] = None    # Caller-supplied pip size. When None (default), engine falls back to get_pip_size(symbol). Set this to avoid relying on the engine's symbol-keyword lookup when the backend already knows the correct pip size.
 
 
 # ─── Legacy Fixed-Indicator Request ────────────────────────────────────────────
@@ -656,6 +659,7 @@ class WalkForwardRequest(BaseModel):
     spreadPips: float = 0.0
     slippagePips: float = 0.0
     maxOpenPositions: int = 1           # Engine is single-position only. Values >1 are clamped to 1 with a warning.
+    pip_size: Optional[float] = None    # Caller-supplied pip size. When None, engine falls back to get_pip_size(symbol).
     # Walk-forward settings
     nWindows: int = 5          # number of windows
     inSamplePct: float = 0.7   # fraction of each window used for in-sample (0.7 = 70%)
@@ -764,6 +768,7 @@ class OptimizeRequest(BaseModel):
     optimizeFor: Literal["sharpe", "netProfit", "winRate", "profitFactor", "returnDrawdown"] = "sharpe"
     secondaryObjective: Optional[Literal["sharpe", "netProfit", "winRate", "profitFactor", "maxDrawdown", "returnDrawdown"]] = None
     maxCombinations: int = 500   # cap to avoid runaway compute (raised from 200)
+    pip_size: Optional[float] = None    # Caller-supplied pip size. When None, engine falls back to get_pip_size(symbol).
     # Walk-forward fields — when enabled, combos are scored by avg out-of-sample performance
     walkForwardEnabled: bool = False
     nWindows: int = 5
@@ -1465,7 +1470,9 @@ async def run_custom_backtest(req: CustomBacktestRequest):
             print(f"[backtest-custom] maxOpenPositions={req.maxOpenPositions} requested but engine supports only 1 open position at a time. Clamping to 1.")
             req.maxOpenPositions = 1
 
-        pip_size = get_pip_size(req.symbol) if req.symbol else 0.0001
+        # Prefer the caller-supplied pip_size when provided (canonical source of truth).
+        # Fall back to the engine's symbol-keyword lookup so older callers continue to work.
+        pip_size = req.pip_size if (getattr(req, "pip_size", None) is not None) else (get_pip_size(req.symbol) if req.symbol else 0.0001)
 
         # ── Determine active SL/TP mode ──────────────────────────────────────────
         # Priority: 1) sl_price/tp_price from Python signals  2) pips  3) percent
@@ -1595,7 +1602,9 @@ async def run_walk_forward(req: WalkForwardRequest):
         if window_size < 60:
             raise HTTPException(status_code=400, detail="Not enough bars per window. Reduce nWindows or provide more data.")
 
-        pip_size = get_pip_size(req.symbol) if req.symbol else 0.0001
+        # Prefer the caller-supplied pip_size when provided (canonical source of truth).
+        # Fall back to the engine's symbol-keyword lookup so older callers continue to work.
+        pip_size = req.pip_size if (getattr(req, "pip_size", None) is not None) else (get_pip_size(req.symbol) if req.symbol else 0.0001)
         windows = []
 
         for w in range(req.nWindows):
@@ -1880,7 +1889,9 @@ async def run_optimize(req: OptimizeRequest):
             all_combos = [all_combos[i] for i in indices]
 
         df = bars_to_df(ohlc_bars)
-        pip_size = get_pip_size(req.symbol) if req.symbol else 0.0001
+        # Prefer the caller-supplied pip_size when provided (canonical source of truth).
+        # Fall back to the engine's symbol-keyword lookup so older callers continue to work.
+        pip_size = req.pip_size if (getattr(req, "pip_size", None) is not None) else (get_pip_size(req.symbol) if req.symbol else 0.0001)
         results = []
         tested_combinations = 0   # counts every combo attempted, regardless of outcome
 
