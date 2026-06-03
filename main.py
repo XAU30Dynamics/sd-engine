@@ -46,7 +46,7 @@ import traceback
 import uuid
 import types
 
-app = FastAPI(title="AlgoTrader Backtest Engine", version="3.3.2")
+app = FastAPI(title="AlgoTrader Backtest Engine", version="3.4.0")
 
 # Read allowed origins from ALLOWED_ORIGINS env var (comma-separated) or use safe defaults.
 # Set ALLOWED_ORIGINS="https://myapp.com,https://api.myapp.com" on the server to restrict access.
@@ -709,9 +709,24 @@ class MonteCarloRequest(BaseModel):
     initialCapital: float = 100000.0
     nSimulations: int = 1000
     confidenceLevels: List[float] = [0.05, 0.25, 0.50, 0.75, 0.95]
-    resampleMode: Literal["bootstrap", "shuffle"] = "bootstrap"
-    # bootstrap = resample with replacement (standard Monte Carlo)
+    resampleMode: Literal["bootstrap", "shuffle", "block"] = "bootstrap"
+    # bootstrap = resample single trades with replacement (standard Monte Carlo)
     # shuffle   = random permutation of the exact trade sequence (no replacement)
+    # block     = resample CONTIGUOUS blocks of trades with replacement — preserves
+    #             win/loss streak autocorrelation, giving realistic drawdown tails
+    blockSize: int = 0           # 0 = auto (~sqrt(n_trades)); only used when resampleMode="block"
+    # ── Risk-of-ruin (intra-path, measured from the starting balance) ──
+    ruinThresholdPct: float = 50.0   # a path is "ruined" if equity EVER falls this % below start
+    # ── Prop-firm challenge model ──
+    # A path PASSES if it reaches +propProfitTargetPct before its drawdown breaches
+    # propMaxDrawdownPct; it FAILS if the drawdown cap is breached first.
+    propProfitTargetPct: float = 10.0
+    propMaxDrawdownPct: float = 10.0
+    propDrawdownMode: Literal["trailing", "initial"] = "trailing"
+    # trailing = drawdown from the running peak (matches the app's maxDrawdownPercent)
+    # initial  = loss from the starting balance (static max-loss rule some firms use)
+    horizonTrades: int = 0       # 0 = use the backtest's trade count; else simulate this many
+                                 # trades per path (e.g. the trades expected in a 6-week phase)
 
 
 class MonteCarloResult(BaseModel):
@@ -727,10 +742,18 @@ class MonteCarloResult(BaseModel):
     worstCaseFinalEquity: float    # 5th percentile
     bestCaseFinalEquity: float     # 95th percentile
     probabilityOfProfit: float     # % of sims that ended profitable
-    probabilityOfRuin: float       # % of sims that lost more than 50% of capital
+    probabilityOfRuin: float       # % of sims whose equity EVER fell ruinThresholdPct below start (INTRA-PATH)
+    ruinThresholdPct: float = 50.0 # echo of the threshold used for probabilityOfRuin
     # Max drawdown distribution
     medianMaxDrawdown: float
     worstCaseMaxDrawdown: float    # 95th percentile drawdown
+    # ── Prop-firm challenge outcomes (reach target before breaching the DD cap) ──
+    propProfitTargetPct: float = 0.0
+    propMaxDrawdownPct: float = 0.0
+    propPassProbability: float = 0.0     # % that hit the profit target before the DD cap
+    propFailDrawdown: float = 0.0        # % that breached the DD cap before the target
+    propIncomplete: float = 0.0          # % that did neither within the trade horizon
+    medianTradesToTarget: float = 0.0    # among passers, median trades taken to reach target
     # Percentile curves (sampled equity curves at key percentiles)
     percentileCurves: dict         # {"p5": [...], "p25": [...], "p50": [...], "p75": [...], "p95": [...]}
     createdAt: str
@@ -1751,44 +1774,82 @@ async def run_monte_carlo(req: MonteCarloRequest):
         if len(req.trades) < 5:
             raise HTTPException(status_code=400, detail="Need at least 5 trades to run Monte Carlo simulation")
 
-        # Extract trade P&L percentages
-        pnl_pcts = [t.pnlPercent / 100 for t in req.trades]
+        # Per-trade fractional returns (pnlPercent is pnl / equity-at-the-time, so
+        # compounding equity *= (1 + r) is the correct fractional-return model).
+        pnl_pcts = np.array([t.pnlPercent / 100.0 for t in req.trades], dtype=float)
         n_trades = len(pnl_pcts)
-
-        final_equities = []
-        max_drawdowns = []
-
-        # Store sampled curves at key percentiles (downsample to 200 points for response size)
-        all_curves = []
+        horizon = req.horizonTrades if (req.horizonTrades and req.horizonTrades > 0) else n_trades
+        block = req.blockSize if (req.blockSize and req.blockSize > 0) else max(2, int(round(n_trades ** 0.5)))
 
         rng = np.random.default_rng(42)  # fixed seed for reproducibility
 
-        for _ in range(req.nSimulations):
+        target_mult   = 1.0 + req.propProfitTargetPct / 100.0
+        cap_frac      = req.propMaxDrawdownPct / 100.0
+        ruin_floor    = req.ruinThresholdPct / 100.0   # ruined if equity <= start*(1 - this), intra-path
+
+        def resample(gen):
+            """Draw `horizon` trade returns under the chosen resample mode."""
             if req.resampleMode == "shuffle":
-                sampled = rng.permutation(pnl_pcts)
-            else:  # bootstrap (default)
-                sampled = rng.choice(pnl_pcts, size=n_trades, replace=True)
+                # Permutation(s) of the exact sequence — no replacement.
+                if horizon <= n_trades:
+                    return gen.permutation(pnl_pcts)[:horizon]
+                reps = horizon // n_trades + 1
+                return np.concatenate([gen.permutation(pnl_pcts) for _ in range(reps)])[:horizon]
+            if req.resampleMode == "block":
+                # Contiguous blocks (circular) — preserves win/loss streak autocorrelation.
+                out = np.empty(horizon)
+                filled = 0
+                while filled < horizon:
+                    start = int(gen.integers(0, n_trades))
+                    take = min(block, horizon - filled)
+                    for k in range(take):
+                        out[filled + k] = pnl_pcts[(start + k) % n_trades]
+                    filled += take
+                return out
+            return gen.choice(pnl_pcts, size=horizon, replace=True)  # bootstrap (default)
 
+        final_equities = np.empty(req.nSimulations)
+        max_drawdowns  = np.empty(req.nSimulations)
+        ruin_flags     = np.zeros(req.nSimulations, dtype=bool)
+        outcomes       = []                    # 'pass' | 'fail' | 'incomplete'
+        trades_to_target = []
+        all_curves = []
+
+        for s in range(req.nSimulations):
+            sampled = resample(rng)
             equity = req.initialCapital
-            curve = [equity]
-            peak = equity
+            peak   = equity
             max_dd = 0.0
+            ruined = False
+            outcome = "incomplete"
+            curve = [equity]
 
-            for r in sampled:
-                equity *= (1 + r)
+            for i, r in enumerate(sampled):
+                equity *= (1.0 + r)
                 curve.append(round(equity, 2))
                 if equity > peak:
                     peak = equity
-                dd = ((peak - equity) / peak) * 100
-                if dd > max_dd:
-                    max_dd = dd
+                dd_trailing = (peak - equity) / peak if peak > 0 else 0.0
+                dd_static   = (req.initialCapital - equity) / req.initialCapital
+                if dd_trailing * 100 > max_dd:
+                    max_dd = dd_trailing * 100
+                # Intra-path ruin: equity ever this far below the starting balance.
+                if not ruined and dd_static >= ruin_floor:
+                    ruined = True
+                # Prop challenge: first event wins (breach the DD cap, or hit the target).
+                if outcome == "incomplete":
+                    breach_dd = dd_trailing if req.propDrawdownMode == "trailing" else dd_static
+                    if breach_dd >= cap_frac:
+                        outcome = "fail"
+                    elif equity >= req.initialCapital * target_mult:
+                        outcome = "pass"
+                        trades_to_target.append(i + 1)
 
-            final_equities.append(equity)
-            max_drawdowns.append(max_dd)
+            final_equities[s] = equity
+            max_drawdowns[s]  = max_dd
+            ruin_flags[s]     = ruined
+            outcomes.append(outcome)
             all_curves.append(curve)
-
-        final_equities = np.array(final_equities)
-        max_drawdowns = np.array(max_drawdowns)
 
         # Downsample curves to 100 points each for response efficiency
         def downsample(curve, points=100):
@@ -1805,7 +1866,12 @@ async def run_monte_carlo(req: MonteCarloRequest):
             percentile_curves[pct_label] = np.percentile(all_curves_arr, level * 100, axis=0).tolist()
 
         prob_of_profit = float(np.mean(final_equities > req.initialCapital) * 100)
-        prob_of_ruin = float(np.mean(final_equities < req.initialCapital * 0.5) * 100)
+        prob_of_ruin   = float(np.mean(ruin_flags) * 100)   # INTRA-PATH (not final-equity)
+        n = max(1, req.nSimulations)
+        pass_pct = outcomes.count("pass") / n * 100
+        fail_pct = outcomes.count("fail") / n * 100
+        inc_pct  = outcomes.count("incomplete") / n * 100
+        median_tt = float(np.median(trades_to_target)) if trades_to_target else 0.0
 
         completed_at = datetime.utcnow()
         return MonteCarloResult(
@@ -1821,8 +1887,15 @@ async def run_monte_carlo(req: MonteCarloRequest):
             bestCaseFinalEquity=round(float(np.percentile(final_equities, 95)), 2),
             probabilityOfProfit=round(prob_of_profit, 2),
             probabilityOfRuin=round(prob_of_ruin, 2),
+            ruinThresholdPct=req.ruinThresholdPct,
             medianMaxDrawdown=round(float(np.median(max_drawdowns)), 2),
             worstCaseMaxDrawdown=round(float(np.percentile(max_drawdowns, 95)), 2),
+            propProfitTargetPct=req.propProfitTargetPct,
+            propMaxDrawdownPct=req.propMaxDrawdownPct,
+            propPassProbability=round(pass_pct, 2),
+            propFailDrawdown=round(fail_pct, 2),
+            propIncomplete=round(inc_pct, 2),
+            medianTradesToTarget=round(median_tt, 1),
             percentileCurves=percentile_curves,
             createdAt=datetime.utcnow().isoformat(),
             startedAt=started_at.isoformat(),
@@ -2496,6 +2569,10 @@ async def update_engine(request: Request):
 
 @app.get("/health")
 async def health():
+    # Read version from the FastAPI app object so there's only one source of truth.
+    # Previously this was a hardcoded literal that drifted from the FastAPI title
+    # version, silently breaking the in-app Update Engine flow (Settings would keep
+    # showing the stale literal even after a successful auto-update).
     return {
         "status": "ok",
         "version": app.version,
