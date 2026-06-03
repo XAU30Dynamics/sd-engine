@@ -37,14 +37,23 @@ cp "$tmp" "$TARGET"
 
 echo "==> Starting service..."
 systemctl start "$SVC"
-sleep 2
 
-echo "==> Verifying..."
-LIVE="$(curl -fsS "http://127.0.0.1:$PORT/health" | grep -oP '"version":"\K[^"]+' || echo FAILED)"
+echo "==> Verifying (waiting for engine to come up)..."
+LIVE=""
+for i in $(seq 1 30); do
+  LIVE="$(curl -fsS "http://127.0.0.1:$PORT/health" 2>/dev/null | grep -oP '"version":"\K[^"]+' || true)"
+  [ -n "$LIVE" ] && break
+  sleep 1
+done
+
 if [ "$LIVE" = "$NEW" ]; then
   echo "✅ Engine updated and live: v$LIVE"
-else
+elif [ -n "$LIVE" ]; then
   echo "⚠️  Live version (v$LIVE) does not match downloaded (v$NEW)." >&2
+  echo "    Check: systemctl status $SVC   and   journalctl -u $SVC -n 50" >&2
+  exit 1
+else
+  echo "⚠️  Engine did not respond on port $PORT within 30s." >&2
   echo "    Check: systemctl status $SVC   and   journalctl -u $SVC -n 50" >&2
   exit 1
 fi
